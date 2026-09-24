@@ -1,0 +1,4 @@
+#!/bin/zsh
+SOURCE="${0:A}"
+ROOT="$(cd "$(dirname "$SOURCE")/../../.." && pwd)"
+exec "$ROOT/bin/codex-tz" app

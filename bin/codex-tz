@@ -1,0 +1,237 @@
+#!/bin/zsh
+set -euo pipefail
+
+SOURCE="${0:A}"
+ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+CONF="$ROOT/timezone.conf"
+EXAMPLE="$ROOT/timezone.conf.example"
+LAUNCHER="$ROOT/Codex.app"
+DESKTOP_BUNDLE_ID="com.openai.codex"
+LAUNCHER_BUNDLE_ID="local.codex.timezone-launcher"
+
+usage() {
+  cat <<'EOF'
+用法:
+  bin/codex-tz install      按当前目录把 Codex.app 固定到程序坞
+  bin/codex-tz app          用 timezone.conf 里的时区启动 Codex 桌面版
+                            若已用该时区在运行，则只把窗口带到前面
+  bin/codex-tz cli [参数]   用该时区运行 Codex CLI，参数原样传给 codex
+
+时区写在 timezone.conf 的 TIMEZONE= 中。这不会修改 macOS 的系统时区。
+把整个目录移走之后，重新执行 install，程序坞图标会改指向新位置。
+EOF
+}
+
+load_timezone() {
+  if [[ ! -f "$CONF" ]]; then
+    if [[ -f "$EXAMPLE" ]]; then
+      cp "$EXAMPLE" "$CONF"
+      echo "已根据示例创建 $CONF" >&2
+    else
+      echo "找不到 $CONF" >&2
+      exit 1
+    fi
+  fi
+  # shellcheck disable=SC1090
+  source "$CONF"
+  if [[ -z "${TIMEZONE:-}" ]]; then
+    echo "请先在 timezone.conf 里设置 TIMEZONE" >&2
+    exit 1
+  fi
+  if [[ ! "$TIMEZONE" =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]]; then
+    echo "时区格式无效: $TIMEZONE" >&2
+    exit 1
+  fi
+  if [[ ! -e "/usr/share/zoneinfo/$TIMEZONE" ]]; then
+    echo "系统里没有这个时区: $TIMEZONE" >&2
+    exit 1
+  fi
+}
+
+resolve_desktop_app() {
+  local candidate info bid
+  DESKTOP_APP=""
+  while IFS= read -r candidate; do
+    [[ -d "$candidate" ]] || continue
+    info="$candidate/Contents/Info.plist"
+    [[ -f "$info" ]] || continue
+    bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info" 2>/dev/null || true)"
+    if [[ "$bid" == "$DESKTOP_BUNDLE_ID" ]]; then
+      DESKTOP_APP="${candidate%/}"
+      break
+    fi
+  done < <(mdfind "kMDItemCFBundleIdentifier == \"${DESKTOP_BUNDLE_ID}\"" 2>/dev/null || true)
+  if [[ -z "$DESKTOP_APP" ]]; then
+    local dir
+    for dir in /Applications "$HOME/Applications"; do
+      [[ -d "$dir" ]] || continue
+      for candidate in "$dir"/*.app; do
+        [[ -d "$candidate" ]] || continue
+        info="$candidate/Contents/Info.plist"
+        [[ -f "$info" ]] || continue
+        bid="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info" 2>/dev/null || true)"
+        if [[ "$bid" == "$DESKTOP_BUNDLE_ID" ]]; then
+          DESKTOP_APP="${candidate%/}"
+          break 2
+        fi
+      done
+    done
+  fi
+  [[ -n "$DESKTOP_APP" ]] || return 1
+  DESKTOP_EXE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$DESKTOP_APP/Contents/Info.plist")"
+  DESKTOP_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleName' "$DESKTOP_APP/Contents/Info.plist")"
+  return 0
+}
+
+resolve_cli() {
+  if [[ -n "${CODEX_BIN:-}" && -x "$CODEX_BIN" ]]; then
+    return 0
+  fi
+  CODEX_BIN="$(command -v codex || true)"
+  [[ -n "$CODEX_BIN" && -x "$CODEX_BIN" ]]
+}
+
+notify() {
+  local message="$1"
+  if [[ -t 1 ]]; then
+    echo "$message" >&2
+  else
+    osascript -e "display alert \"Codex\" message \"${message//\"/\\\"}\"" >/dev/null
+  fi
+}
+
+cmd_app() {
+  load_timezone
+  if ! resolve_desktop_app; then
+    notify "找不到 Codex 桌面版。"
+    exit 1
+  fi
+  local pid
+  pid="$(pgrep -x "$DESKTOP_EXE" | head -n 1 || true)"
+  if [[ -n "$pid" ]] && ps eww -p "$pid" | tr ' ' '\n' | grep -qx "TZ=$TIMEZONE"; then
+    open -a "$DESKTOP_APP"
+    return
+  fi
+  if [[ -n "$pid" ]]; then
+    osascript -e "tell application \"$DESKTOP_NAME\" to quit" >/dev/null 2>&1 || true
+    local i
+    for i in {1..25}; do
+      pgrep -x "$DESKTOP_EXE" >/dev/null || break
+      sleep 0.2
+    done
+    if pgrep -x "$DESKTOP_EXE" >/dev/null; then
+      notify "Codex 正在运行，且没有使用 $TIMEZONE。请先完全退出后再点一次图标。"
+      exit 1
+    fi
+  fi
+  open -a "$DESKTOP_APP" --env "TZ=$TIMEZONE"
+  if [[ -t 1 ]]; then
+    echo "已用时区 $TIMEZONE 启动 Codex。macOS 系统时区未修改。"
+  fi
+}
+
+cmd_cli() {
+  load_timezone
+  if ! resolve_cli; then
+    echo "找不到 codex。请先安装 Codex CLI，或设置 CODEX_BIN。" >&2
+    exit 1
+  fi
+  export TZ="$TIMEZONE"
+  exec "$CODEX_BIN" "$@"
+}
+
+cmd_install() {
+  if [[ ! -d "$LAUNCHER" ]]; then
+    echo "找不到 $LAUNCHER" >&2
+    exit 1
+  fi
+  if [[ ! -f "$CONF" && -f "$EXAMPLE" ]]; then
+    cp "$EXAMPLE" "$CONF"
+    echo "已创建 $CONF"
+  fi
+  chmod +x "$LAUNCHER/Contents/MacOS/Codex" "$ROOT/bin/codex-tz"
+  codesign --force --sign - "$LAUNCHER" >/dev/null
+  local lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+  "$lsregister" -f "$LAUNCHER"
+  mkdir -p "$HOME/Applications"
+  ln -sfn "$LAUNCHER" "$HOME/Applications/Codex时区.app"
+  python3 - "$LAUNCHER" "$LAUNCHER_BUNDLE_ID" << 'PY'
+import plistlib
+import random
+import sys
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+app = Path(sys.argv[1]).resolve()
+bundle_id = sys.argv[2]
+url = app.as_uri()
+if not url.endswith("/"):
+    url += "/"
+info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+label = info.get("CFBundleDisplayName") or info.get("CFBundleName") or app.stem
+
+def is_ours(item):
+    tile = item.get("tile-data", {})
+    if tile.get("bundle-identifier") == bundle_id:
+        return True
+    file_url = tile.get("file-data", {}).get("_CFURLString", "")
+    if not file_url.startswith("file:"):
+        return False
+    path = Path(unquote(urlparse(file_url).path))
+    plist_path = path / "Contents/Info.plist"
+    if not plist_path.is_file():
+        return False
+    try:
+        data = plistlib.loads(plist_path.read_bytes())
+    except Exception:
+        return False
+    return data.get("CFBundleIdentifier") == bundle_id
+
+dock_plist = Path.home() / "Library/Preferences/com.apple.dock.plist"
+data = plistlib.loads(dock_plist.read_bytes())
+apps = [item for item in data.get("persistent-apps", []) if not is_ours(item)]
+apps.append({
+    "GUID": random.randint(1, 2**31 - 1),
+    "tile-type": "file-tile",
+    "tile-data": {
+        "bundle-identifier": bundle_id,
+        "file-label": label,
+        "file-type": 41,
+        "file-data": {
+            "_CFURLString": url,
+            "_CFURLStringType": 15,
+        },
+    },
+})
+data["persistent-apps"] = apps
+dock_plist.write_bytes(plistlib.dumps(data, fmt=plistlib.FMT_BINARY))
+print(url)
+PY
+  killall Dock
+  echo "已把程序坞图标指向 $LAUNCHER"
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    app)
+      cmd_app
+      ;;
+    cli)
+      shift
+      cmd_cli "$@"
+      ;;
+    install)
+      cmd_install
+      ;;
+    -h|--help|help|"")
+      usage
+      ;;
+    *)
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

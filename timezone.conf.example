@@ -1,0 +1,3 @@
+# 只影响通过本工具启动的 Codex，不修改 macOS 系统时区。
+# 填写 IANA 时区名。需要 UTC 时写 Etc/UTC，不要写 UTC。
+TIMEZONE=America/Los_Angeles
