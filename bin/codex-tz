@@ -155,7 +155,11 @@ cmd_install() {
   "$lsregister" -f "$LAUNCHER"
   mkdir -p "$HOME/Applications"
   ln -sfn "$LAUNCHER" "$HOME/Applications/Codex时区.app"
-  python3 - "$LAUNCHER" "$LAUNCHER_BUNDLE_ID" << 'PY'
+  if [[ ! -x /usr/bin/python3 ]]; then
+    echo "需要 macOS 自带的 /usr/bin/python3 来更新程序坞。" >&2
+    exit 1
+  fi
+  /usr/bin/python3 - "$LAUNCHER" "$LAUNCHER_BUNDLE_ID" << 'PY'
 import plistlib
 import random
 import sys
