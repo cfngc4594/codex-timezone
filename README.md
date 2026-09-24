@@ -6,4 +6,4 @@
 curl -fsSL https://raw.githubusercontent.com/cfngc4594/codex-timezone/main/install.sh | bash
 ```
 
-安装时在终端里选择节点所在时区。可以输入编号、城市代码（如 LAX、NRT）或 IANA 时区名。已有配置时，直接回车保持不变。
+安装时用上下键选择节点所在时区，回车确认。当前时区会预先选中。其他时区可以选「手动输入」，再填写城市代码或 IANA 时区名。

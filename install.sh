@@ -72,8 +72,79 @@ tty_available() {
   ( : </dev/tty ) 2>/dev/null
 }
 
+enter_menu_tty() {
+  [[ -n "${menu_stty:-}" ]] || menu_stty="$(stty -g </dev/tty)"
+  stty -echo -icanon min 1 time 0 </dev/tty
+  printf '\033[?25l' >/dev/tty
+}
+
+leave_menu_tty() {
+  if [[ -n "${menu_stty:-}" ]]; then
+    stty "$menu_stty" </dev/tty 2>/dev/null || true
+    menu_stty=""
+  fi
+  printf '\033[?25h' >/dev/tty 2>/dev/null || true
+}
+
+read_menu_key() {
+  local key rest
+  IFS= read -rsn1 key </dev/tty || return 1
+  if [[ "$key" == $'\033' ]]; then
+    stty -echo -icanon min 0 time 1 </dev/tty
+    rest=""
+    IFS= read -rsn2 rest </dev/tty || true
+    stty -echo -icanon min 1 time 0 </dev/tty
+    key="${key}${rest}"
+  fi
+  menu_key="$key"
+}
+
+draw_timezone_menu() {
+  local i text
+  {
+    printf '选择节点所在时区。上下键移动，回车确认。\033[K\n'
+    printf '只影响通过本工具启动的 Codex，不修改 macOS 系统时区。\033[K\n'
+    if [[ -n "${menu_error:-}" ]]; then
+      printf '%s\033[K\n' "$menu_error"
+    else
+      printf '\033[K\n'
+    fi
+    for i in "${!menu_labels[@]}"; do
+      if [[ -n "${menu_zones[$i]}" ]]; then
+        text="${menu_labels[$i]} — ${menu_zones[$i]}"
+      else
+        text="${menu_labels[$i]}"
+      fi
+      if [[ "$i" -eq "$menu_index" ]]; then
+        printf '\033[7m> %s\033[0m\033[K\n' "$text"
+      else
+        printf '  %s\033[K\n' "$text"
+      fi
+    done
+  } >/dev/tty
+  menu_lines=$((3 + ${#menu_labels[@]}))
+}
+
+read_custom_timezone() {
+  local input
+  leave_menu_tty
+  printf '输入城市代码或 IANA 时区名: ' >/dev/tty
+  if ! IFS= read -r input </dev/tty; then
+    echo "无法读取时区选择。" >&2
+    exit 1
+  fi
+  menu_custom="$(normalize_timezone "$input")"
+  if timezone_valid "$menu_custom"; then
+    return 0
+  fi
+  menu_error="无法识别或不存在: ${input}"
+  enter_menu_tty
+  menu_jump=$((menu_lines + 1))
+  return 1
+}
+
 choose_timezone() {
-  local current="" default="" input tz
+  local current="" default="" i tz
   if current="$(read_conf_timezone "${DEST}/timezone.conf")" && timezone_valid "$current"; then
     default="$current"
   elif [[ -n "${TIMEZONE:-}" ]] && timezone_valid "${TIMEZONE}"; then
@@ -94,51 +165,110 @@ choose_timezone() {
     exit 1
   fi
 
-  while true; do
-    cat >/dev/tty <<'EOF'
-
-选择节点所在时区。只影响通过本工具启动的 Codex，不修改 macOS 系统时区。
-输入编号、城市代码（如 LAX、NRT）或 IANA 时区名。
-
-  1) 洛杉矶 LAX — America/Los_Angeles
-  2) 纽约 NYC — America/New_York
-  3) 芝加哥 ORD — America/Chicago
-  4) 丹佛 DEN — America/Denver
-  5) 凤凰城 PHX — America/Phoenix
-  6) 檀香山 HNL — Pacific/Honolulu
-  7) 东京 TYO — Asia/Tokyo
-  8) 新加坡 SIN — Asia/Singapore
-  9) 香港 HKG — Asia/Hong_Kong
- 10) 台北 TPE — Asia/Taipei
- 11) 首尔 ICN — Asia/Seoul
- 12) 伦敦 LHR — Europe/London
- 13) 法兰克福 FRA — Europe/Berlin
- 14) UTC — Etc/UTC
-
-EOF
-    if [[ -n "$default" ]]; then
-      printf '直接回车保持 %s\n' "$default" >/dev/tty
+  menu_labels=(
+    "洛杉矶 LAX"
+    "纽约 NYC"
+    "芝加哥 ORD"
+    "丹佛 DEN"
+    "凤凰城 PHX"
+    "檀香山 HNL"
+    "东京 TYO"
+    "新加坡 SIN"
+    "香港 HKG"
+    "台北 TPE"
+    "首尔 ICN"
+    "伦敦 LHR"
+    "法兰克福 FRA"
+    "UTC"
+    "手动输入"
+  )
+  menu_zones=(
+    "America/Los_Angeles"
+    "America/New_York"
+    "America/Chicago"
+    "America/Denver"
+    "America/Phoenix"
+    "Pacific/Honolulu"
+    "Asia/Tokyo"
+    "Asia/Singapore"
+    "Asia/Hong_Kong"
+    "Asia/Taipei"
+    "Asia/Seoul"
+    "Europe/London"
+    "Europe/Berlin"
+    "Etc/UTC"
+    ""
+  )
+  menu_index=0
+  menu_error=""
+  menu_drawn=0
+  menu_jump=0
+  menu_custom=""
+  if [[ -n "$default" ]]; then
+    for i in "${!menu_zones[@]}"; do
+      if [[ "${menu_zones[$i]}" == "$default" ]]; then
+        menu_index="$i"
+        break
+      fi
+    done
+    if [[ "${menu_zones[$menu_index]}" != "$default" ]]; then
+      menu_labels=("保持当前" "${menu_labels[@]}")
+      menu_zones=("$default" "${menu_zones[@]}")
+      menu_index=0
     fi
-    printf '请输入: ' >/dev/tty
-    if ! IFS= read -r input </dev/tty; then
+  fi
+
+  enter_menu_tty
+  trap 'leave_menu_tty; exit 130' INT
+  while true; do
+    if [[ "$menu_drawn" -eq 1 ]]; then
+      if [[ "$menu_jump" -gt 0 ]]; then
+        printf '\033[%dA' "$menu_jump" >/dev/tty
+        menu_jump=0
+      else
+        printf '\033[%dA' "$menu_lines" >/dev/tty
+      fi
+    fi
+    draw_timezone_menu
+    menu_drawn=1
+    if ! read_menu_key; then
+      leave_menu_tty
+      trap - INT
       echo "无法读取时区选择。" >&2
       exit 1
     fi
-    if [[ -z "$(trim "$input")" ]]; then
-      if [[ -n "$default" ]]; then
-        input="$default"
-      else
-        echo "请选择一个时区。" >/dev/tty
-        continue
-      fi
-    fi
-    tz="$(normalize_timezone "$input")"
-    if timezone_valid "$tz"; then
-      write_timezone_conf "$tz"
-      echo "已设置时区 ${tz}"
-      return
-    fi
-    printf '无法识别或不存在: %s\n' "$input" >/dev/tty
+    case "$menu_key" in
+      $'\033[A'|$'\033OA')
+        menu_index=$((menu_index - 1))
+        if [[ "$menu_index" -lt 0 ]]; then
+          menu_index=$((${#menu_labels[@]} - 1))
+        fi
+        ;;
+      $'\033[B'|$'\033OB')
+        menu_index=$((menu_index + 1))
+        if [[ "$menu_index" -ge ${#menu_labels[@]} ]]; then
+          menu_index=0
+        fi
+        ;;
+      ""|$'\r'|$'\n')
+        if [[ -z "${menu_zones[$menu_index]}" ]]; then
+          if read_custom_timezone; then
+            leave_menu_tty
+            trap - INT
+            write_timezone_conf "$menu_custom"
+            echo "已设置时区 ${menu_custom}"
+            return
+          fi
+          continue
+        fi
+        tz="${menu_zones[$menu_index]}"
+        leave_menu_tty
+        trap - INT
+        write_timezone_conf "$tz"
+        echo "已设置时区 ${tz}"
+        return
+        ;;
+    esac
   done
 }
 
